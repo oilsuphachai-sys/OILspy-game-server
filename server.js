@@ -7,20 +7,18 @@ const app = express();
 app.use(cors());
 const server = http.createServer(app);
 
-// ตั้งค่า CORS ให้รับการเชื่อมต่อจากหน้าเว็บได้ทุกที่ (เพื่อความง่ายในการพัฒนา)
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-const rooms = {}; // ตัวแปรเก็บข้อมูลห้องทั้งหมด
+const rooms = {};
 
 io.on('connection', (socket) => {
   console.log('มีผู้ใช้เชื่อมต่อ:', socket.id);
 
-  // 1. ระบบสร้างห้อง
+  // --- 1. ระบบ Lobby (สร้าง/เข้าห้อง) ---
   socket.on('createRoom', ({ isHostPlaying, playerName }, callback) => {
-    const roomCode = Math.random().toString(36).substring(2, 6).toUpperCase(); // สุ่มรหัส 4 หลัก
-    
+    const roomCode = Math.random().toString(36).substring(2, 6).toUpperCase();
     rooms[roomCode] = {
       hostId: socket.id,
       isHostPlaying: isHostPlaying,
@@ -28,19 +26,13 @@ io.on('connection', (socket) => {
       settings: { spyCount: 1, includeJoker: false, includeFBI: false, includeSeer: false, timerSeconds: 180, categories: [] },
       state: 'waiting'
     };
-    
-    // ถ้าครู/คนสร้าง เลือกเล่นด้วย ก็แอดตัวเองเข้าห้อง
     if (isHostPlaying && playerName) {
       rooms[roomCode].players.push({ id: socket.id, name: playerName });
     }
-    
     socket.join(roomCode);
-    console.log(`ห้อง ${roomCode} ถูกสร้างโดย ${socket.id}`);
-    
     callback({ success: true, roomCode, roomData: rooms[roomCode] });
   });
 
-  // 2. ระบบเข้าร่วมห้อง
   socket.on('joinRoom', ({ roomCode, playerName }, callback) => {
     const room = rooms[roomCode];
     if (!room) return callback({ success: false, message: 'ไม่พบรหัสห้องนี้' });
@@ -50,34 +42,86 @@ io.on('connection', (socket) => {
     room.players.push(newPlayer);
     socket.join(roomCode);
     
-    // บรอดแคสต์บอกทุกคนในห้องว่ามีคนเข้ามาใหม่
     io.to(roomCode).emit('updatePlayers', room.players);
     callback({ success: true, roomData: room });
   });
 
-  // 3. ระบบโชว์การตั้งค่าแบบเรียลไทม์ใน Lobby
   socket.on('updateLobbySettings', ({ roomCode, settings }) => {
     const room = rooms[roomCode];
-    // ต้องเป็น Host เท่านั้นถึงจะมีสิทธิ์เปลี่ยนตั้งค่า
     if (room && room.hostId === socket.id) {
       room.settings = settings;
-      io.to(roomCode).emit('settingsUpdated', settings);
+      socket.to(roomCode).emit('settingsUpdated', settings);
     }
   });
 
-  // 4. ระบบ Host เตะผู้เล่นออก (เผื่อมีคนแกล้งพิมพ์ชื่อแปลกๆ เข้ามา)
   socket.on('kickPlayer', ({ roomCode, playerId }) => {
     const room = rooms[roomCode];
     if (room && room.hostId === socket.id) {
       room.players = room.players.filter(p => p.id !== playerId);
       io.to(roomCode).emit('updatePlayers', room.players);
-      io.to(playerId).emit('kicked'); // เตือนคนที่โดนเตะ
+      io.to(playerId).emit('kicked');
+      const targetSocket = io.sockets.sockets.get(playerId);
+      if (targetSocket) targetSocket.leave(roomCode);
     }
   });
 
+  // --- 2. ระบบเริ่มเกมและแจกบทบาท ---
+  socket.on('startGame', ({ roomCode, roles, word, category }) => {
+    const room = rooms[roomCode];
+    if (room && room.hostId === socket.id) {
+      room.state = 'playing';
+      // ส่งข้อมูลลับ (บทบาท/คำลับ) ไปให้ผู้เล่นแต่ละคนโดยตรง
+      room.players.forEach(p => {
+        const playerRole = roles[p.id];
+        const playerWord = (playerRole === 'spy') ? '?????' : word;
+        io.to(p.id).emit('gameStarted', { role: playerRole, word: playerWord, category });
+      });
+      // แจ้ง Host ว่าเกมเริ่มแล้ว
+      io.to(room.hostId).emit('hostGameStarted', { roles, word, category });
+    }
+  });
+
+  // --- 3. ระบบรับส่งสถานะเกมระหว่างเล่น (Host <-> Players) ---
+  socket.on('changePhase', ({ roomCode, phase }) => {
+    const room = rooms[roomCode];
+    if (room && room.hostId === socket.id) {
+      room.state = phase;
+      io.to(roomCode).emit('phaseChanged', phase);
+    }
+  });
+
+  socket.on('updateTimer', ({ roomCode, timeLeft }) => {
+    socket.to(roomCode).emit('timerSync', timeLeft);
+  });
+
+  socket.on('playerAction', ({ roomCode, action, data }) => {
+    const room = rooms[roomCode];
+    if (room) {
+      io.to(room.hostId).emit('playerActionReceived', { playerId: socket.id, action, data });
+    }
+  });
+
+  socket.on('hostUpdateGame', ({ roomCode, updateData }) => {
+    io.to(roomCode).emit('gameUpdated', updateData);
+  });
+
+  // --- 4. ระบบจัดการคนออก ---
   socket.on('disconnect', () => {
-    console.log('ผู้ใช้ตัดการเชื่อมต่อ:', socket.id);
-    // (เดี๋ยวเราจะมาเขียนโค้ดจัดการตอนคนหลุดทีหลังครับ)
+    for (const roomCode in rooms) {
+      const room = rooms[roomCode];
+      const playerIndex = room.players.findIndex(p => p.id === socket.id);
+      
+      if (playerIndex !== -1) {
+        room.players.splice(playerIndex, 1);
+        io.to(roomCode).emit('updatePlayers', room.players);
+        
+        // ถ้าคนสร้างห้องออก ให้แจ้งเตือนและปิดห้อง
+        if (room.hostId === socket.id) {
+          io.to(roomCode).emit('roomClosed', 'ผู้สร้างห้องออกจากการเชื่อมต่อ เกมถูกยกเลิก');
+          delete rooms[roomCode];
+        }
+      }
+    }
   });
 });
 
